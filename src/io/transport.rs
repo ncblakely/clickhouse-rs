@@ -78,6 +78,14 @@ pub(crate) struct PacketStream {
 
 impl ClickhouseTransport {
     pub fn new(inner: InnerStream, compress: bool, pool: Option<Pool>) -> Self {
+        let pool = match pool {
+            None => sync::Weak::new(),
+            Some(pool) => Arc::downgrade(&pool.inner),
+        };
+        Self::new_weak(inner, compress, pool)
+    }
+
+    pub(crate) fn new_weak(inner: InnerStream, compress: bool, pool: sync::Weak<Inner>) -> Self {
         ClickhouseTransport {
             inner,
             done: false,
@@ -140,12 +148,7 @@ impl Drop for TransportStatus {
 }
 
 impl TransportStatus {
-    fn new(pool: Option<Pool>) -> TransportStatus {
-        let pool = match pool {
-            None => sync::Weak::new(),
-            Some(p) => Arc::downgrade(&p.inner),
-        };
-
+    fn new(pool: sync::Weak<Inner>) -> TransportStatus {
         TransportStatus {
             inside: AtomicBool::new(true),
             pool,
