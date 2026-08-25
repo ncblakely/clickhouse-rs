@@ -131,7 +131,7 @@ use crate::{
     connecting_stream::ConnectingStream,
     errors::{DriverError, Error, Result},
     io::ClickhouseTransport,
-    pool::PoolBinding,
+    pool::{PoolBinding, WeakPool},
     retry_guard::retry_guard,
     types::{
         block::{ChunkIterator, INSERT_BLOCK_SIZE},
@@ -255,6 +255,12 @@ pub struct ClientHandle {
     used: AtomicBool, // Whether the connection has been used at least once
 }
 
+enum OpenPool {
+    None,
+    Strong(Pool),
+    Weak(WeakPool),
+}
+
 impl fmt::Debug for ClientHandle {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("ClientHandle")
@@ -271,6 +277,18 @@ impl Client {
     }
 
     pub(crate) async fn open(source: OptionsSource, pool: Option<Pool>) -> Result<ClientHandle> {
+        let pool = match pool {
+            Some(pool) => OpenPool::Strong(pool),
+            None => OpenPool::None,
+        };
+        Self::open_with_pool(source, pool).await
+    }
+
+    pub(crate) async fn open_weak(source: OptionsSource, pool: WeakPool) -> Result<ClientHandle> {
+        Self::open_with_pool(source, OpenPool::Weak(pool)).await
+    }
+
+    async fn open_with_pool(source: OptionsSource, pool: OpenPool) -> Result<ClientHandle> {
         let options = try_opt!(source.get());
         let compress = options.compression;
         let timeout = options.connection_timeout;
@@ -284,25 +302,34 @@ impl Client {
             "connect",
             async move {
                 let addr = match &pool {
-                    None => &options.addr,
-                    Some(p) => p.get_addr(),
+                    OpenPool::None => options.addr.clone(),
+                    OpenPool::Strong(pool) => pool.get_addr().clone(),
+                    OpenPool::Weak(pool) => pool.get_addr()?,
                 };
 
                 info!("try to connect to {}", addr);
                 if addr.port() == Some(8123) {
                     warn!("You should use port 9000 instead of 8123 because clickhouse-rs work through the binary interface.");
                 }
-                let mut stream = ConnectingStream::new(addr, &options).await?;
+                let mut stream = ConnectingStream::new(&addr, &options).await?;
                 stream.set_nodelay(options.nodelay)?;
                 stream.set_keepalive(options.keepalive)?;
 
-                let transport = ClickhouseTransport::new(stream, compress, pool.clone());
+                let transport = match &pool {
+                    OpenPool::None => ClickhouseTransport::new(stream, compress, None),
+                    OpenPool::Strong(pool) => {
+                        ClickhouseTransport::new(stream, compress, Some(pool.clone()))
+                    }
+                    OpenPool::Weak(pool) => {
+                        ClickhouseTransport::new_weak(stream, compress, pool.inner())
+                    }
+                };
                 let mut handle = ClientHandle {
                     inner: Some(transport),
                     context,
                     pool: match pool {
-                        None => PoolBinding::None,
-                        Some(p) => PoolBinding::Detached(p),
+                        OpenPool::Strong(pool) => PoolBinding::Detached(pool),
+                        OpenPool::None | OpenPool::Weak(_) => PoolBinding::None,
                     },
                     used: false.into(),
                 };

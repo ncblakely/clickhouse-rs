@@ -1,11 +1,11 @@
 use std::{
     fmt,
-    io::ErrorKind,
+    io::{Error as IoError, ErrorKind},
     mem,
     pin::Pin,
     sync::{
         atomic::{self, Ordering},
-        Arc,
+        Arc, Weak,
     },
     task::{Context, Poll, Waker},
     time::Duration,
@@ -45,6 +45,35 @@ pub(crate) struct Inner {
     pending_opens: atomic::AtomicUsize,
     hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakPool {
+    inner: Weak<Inner>,
+}
+
+impl WeakPool {
+    fn new(pool: &Pool) -> Self {
+        Self {
+            inner: Arc::downgrade(&pool.inner),
+        }
+    }
+
+    pub(crate) fn get_addr(&self) -> Result<Url> {
+        let inner = self.inner.upgrade().ok_or_else(|| {
+            Error::Io(IoError::new(
+                ErrorKind::ConnectionAborted,
+                "ClickHouse pool was dropped while opening a connection",
+            ))
+        })?;
+        let n = inner.hosts.len();
+        let index = inner.connections_num.fetch_add(1, Ordering::SeqCst);
+        Ok(inner.hosts[index % n].clone())
+    }
+
+    pub(crate) fn inner(&self) -> Weak<Inner> {
+        self.inner.clone()
+    }
 }
 
 impl Inner {
@@ -344,7 +373,7 @@ impl Pool {
 
     fn new_connection(&self) -> BoxFuture<'static, Result<ClientHandle>> {
         let source = self.options.clone();
-        let pool = Some(self.clone());
+        let pool = WeakPool::new(self);
 
         let (max_attempts, retry_timeout) = {
             match source.get() {
@@ -358,14 +387,14 @@ impl Pool {
 
     async fn retry_open(
         source: OptionsSource,
-        pool: Option<Pool>,
+        pool: WeakPool,
         max_attempts: usize,
         retry_timeout: Duration,
     ) -> Result<ClientHandle> {
         let mut attempt = 0;
 
         loop {
-            let result = Client::open(source.clone(), pool.clone()).await;
+            let result = Client::open_weak(source.clone(), pool.clone()).await;
 
             match result {
                 Err(Error::Io(ref err)) => {
@@ -433,8 +462,10 @@ impl Pool {
             // The pending-open reservation moves with this future while it is polled.
             // Terminal paths release it; pending futures keep it when requeued.
             match new.poll_unpin(cx) {
-                Poll::Ready(Ok(client)) => {
+                Poll::Ready(Ok(mut client)) => {
                     self.inner.release_pending_open();
+                    client.pool = PoolBinding::None;
+                    client.set_inside(true);
                     if self.inner.idle.push(client).is_err() {
                         self.inner.release_conn_slot();
                         warn!(
@@ -705,6 +736,62 @@ mod test {
             pool: PoolBinding::Detached(pool.clone()),
             used: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn test_pool_lifetime_pending_open_does_not_keep_pool_alive() {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let inner = Arc::downgrade(&pool.inner);
+        reserve_pending_open(&pool);
+        assert!(pool.inner.new.push(pool.new_connection()).is_ok());
+
+        drop(pool);
+
+        assert!(inner.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_lifetime_completed_idle_does_not_keep_pool_alive() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let inner = Arc::downgrade(&pool.inner);
+        reserve_pending_open(&pool);
+        assert!(pool
+            .inner
+            .new
+            .push(Box::pin(future::ready(Ok(
+                synthetic_idle_client(&pool).await
+            ))))
+            .is_ok());
+
+        let (_, waker) = count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut driver = pool.clone();
+        driver.handle_futures(&mut cx)?;
+        drop(driver);
+        drop(pool);
+
+        assert!(inner.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pool_lifetime_detached_handle_keeps_pool_alive_until_drop() -> Result<()> {
+        let pool = Pool::new(Options::default().pool_min(0).pool_max(1));
+        let inner = Arc::downgrade(&pool.inner);
+        reserve_conn(&pool);
+        pool.inner
+            .idle
+            .push(synthetic_idle_client(&pool).await)
+            .unwrap();
+
+        let mut handle = pool.get_handle().await?;
+        handle.pool.detach();
+        drop(pool);
+
+        assert!(inner.upgrade().is_some());
+        drop(handle);
+        assert!(inner.upgrade().is_none());
+        Ok(())
     }
 
     fn reserve_conn(pool: &Pool) {
