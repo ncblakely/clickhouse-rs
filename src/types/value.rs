@@ -48,6 +48,7 @@ pub enum Value {
     Uuid([u8; 16]),
     Nullable(Either<&'static SqlType, Box<Value>>),
     Array(&'static SqlType, Arc<Vec<Value>>),
+    Tuple(&'static SqlType, Arc<Vec<Value>>),
     Decimal(Decimal),
     Enum8(Vec<(String, i8)>, Enum8),
     Enum16(Vec<(String, i16)>, Enum16),
@@ -75,6 +76,10 @@ impl Hash for Value {
             Self::Date(d) => d.hash(state),
             Self::DateTime(t, _) => t.hash(state),
             Self::DateTime64(t, (prec_a, _)) => (*t, *prec_a).hash(state),
+            Self::Tuple(t, values) => {
+                t.hash(state);
+                values.hash(state);
+            }
             _ => unimplemented!(),
         }
     }
@@ -108,6 +113,7 @@ impl PartialEq for Value {
             (Value::ChronoDateTime(a), Value::ChronoDateTime(b)) => *a == *b,
             (Value::Nullable(a), Value::Nullable(b)) => *a == *b,
             (Value::Array(ta, a), Value::Array(tb, b)) => *ta == *tb && *a == *b,
+            (Value::Tuple(ta, a), Value::Tuple(tb, b)) => *ta == *tb && *a == *b,
             (Value::Decimal(a), Value::Decimal(b)) => *a == *b,
             (Value::Enum8(values_a, val_a), Value::Enum8(values_b, val_b)) => {
                 *values_a == *values_b && *val_a == *val_b
@@ -187,6 +193,13 @@ impl Value {
             SqlType::Enum8(values) => Value::Enum8(values, Enum8(0)),
             SqlType::Enum16(values) => Value::Enum16(values, Enum16(0)),
             SqlType::Map(k, v) => Value::Map(k, v, Arc::new(HashMap::default())),
+            SqlType::Tuple(ref fields) => {
+                let values = fields
+                    .iter()
+                    .map(|(_, sql_type)| Value::default(sql_type.clone()))
+                    .collect();
+                Value::Tuple(sql_type.into(), Arc::new(values))
+            }
         }
     }
 }
@@ -247,6 +260,10 @@ impl fmt::Display for Value {
                 let cells: Vec<String> = vs.iter().map(|v| format!("{v}")).collect();
                 write!(f, "[{}]", cells.join(", "))
             }
+            Value::Tuple(_, vs) => {
+                let cells: Vec<String> = vs.iter().map(|v| format!("{v}")).collect();
+                write!(f, "({})", cells.join(", "))
+            }
             Value::Decimal(v) => fmt::Display::fmt(v, f),
             Value::Ipv4(v) => {
                 write!(f, "{}", decode_ipv4(v))
@@ -304,6 +321,7 @@ impl From<Value> for SqlType {
                 }
             },
             Value::Array(t, _) => SqlType::Array(t),
+            Value::Tuple(t, _) => t.clone(),
             Value::Decimal(v) => SqlType::Decimal(v.precision, v.scale),
             Value::Ipv4(_) => SqlType::Ipv4,
             Value::Ipv6(_) => SqlType::Ipv6,

@@ -123,6 +123,9 @@ pub enum DriverError {
 
     #[error("Server sent unsupported custom serialization marker (nonzero byte).")]
     UnsupportedCustomSerialization,
+
+    #[error("Tuple columns are supported for result decoding only, not inserts.")]
+    TupleInsertUnsupported,
 }
 
 /// This type enumerates cast from sql type errors.

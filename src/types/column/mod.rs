@@ -53,6 +53,7 @@ mod numeric;
 mod simple_agg_func;
 mod string;
 mod string_pool;
+mod tuple;
 mod util;
 
 /// Represents Clickhouse Column
@@ -248,6 +249,10 @@ impl<K: ColumnType> Column<K> {
 
     pub(crate) fn cast_to(self, dst_type: SqlType) -> Result<Self> {
         let src_type = self.sql_type();
+
+        if src_type.contains_tuple() || dst_type.contains_tuple() {
+            return Err(DriverError::TupleInsertUnsupported.into());
+        }
 
         if dst_type == src_type {
             return Ok(self);

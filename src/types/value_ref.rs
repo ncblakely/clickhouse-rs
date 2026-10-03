@@ -42,6 +42,7 @@ pub enum ValueRef<'a> {
     DateTime64(i64, &'a (u32, Tz)),
     Nullable(Either<&'static SqlType, Box<ValueRef<'a>>>),
     Array(&'static SqlType, Arc<Vec<ValueRef<'a>>>),
+    Tuple(&'static SqlType, Arc<Vec<ValueRef<'a>>>),
     Decimal(Decimal),
     Ipv4([u8; 4]),
     Ipv6([u8; 16]),
@@ -69,6 +70,10 @@ impl<'a> Hash for ValueRef<'a> {
             Self::UInt32(i) => i.hash(state),
             Self::UInt64(i) => i.hash(state),
             Self::UInt128(i) => i.hash(state),
+            Self::Tuple(t, values) => {
+                t.hash(state);
+                values.hash(state);
+            }
             _ => unimplemented!(),
         }
     }
@@ -100,6 +105,7 @@ impl<'a> PartialEq for ValueRef<'a> {
             }
             (ValueRef::Nullable(a), ValueRef::Nullable(b)) => *a == *b,
             (ValueRef::Array(ta, a), ValueRef::Array(tb, b)) => *ta == *tb && *a == *b,
+            (ValueRef::Tuple(ta, a), ValueRef::Tuple(tb, b)) => *ta == *tb && *a == *b,
             (ValueRef::Decimal(a), ValueRef::Decimal(b)) => *a == *b,
             (ValueRef::Enum8(a0, a1), ValueRef::Enum8(b0, b1)) => *a1 == *b1 && *a0 == *b0,
             (ValueRef::Enum16(a0, a1), ValueRef::Enum16(b0, b1)) => *a1 == *b1 && *a0 == *b0,
@@ -176,6 +182,10 @@ impl<'a> fmt::Display for ValueRef<'a> {
                 let cells: Vec<String> = vs.iter().map(|v| format!("{v}")).collect();
                 write!(f, "[{}]", cells.join(", "))
             }
+            ValueRef::Tuple(_, vs) => {
+                let cells: Vec<String> = vs.iter().map(|v| format!("{v}")).collect();
+                write!(f, "({})", cells.join(", "))
+            }
             ValueRef::Decimal(v) => fmt::Display::fmt(v, f),
             ValueRef::Ipv4(v) => {
                 write!(f, "{}", decode_ipv4(v))
@@ -226,6 +236,7 @@ impl<'a> From<ValueRef<'a>> for SqlType {
                 Either::Right(value_ref) => SqlType::Nullable(SqlType::from(*value_ref).into()),
             },
             ValueRef::Array(t, _) => SqlType::Array(t),
+            ValueRef::Tuple(t, _) => t.clone(),
             ValueRef::Decimal(v) => SqlType::Decimal(v.precision, v.scale),
             ValueRef::Enum8(values, _) => SqlType::Enum8(values),
             ValueRef::Enum16(values, _) => SqlType::Enum16(values),
@@ -303,6 +314,9 @@ impl<'a> From<ValueRef<'a>> for Value {
                     value_list.push(value);
                 }
                 Value::Array(t, Arc::new(value_list))
+            }
+            ValueRef::Tuple(t, vs) => {
+                Value::Tuple(t, Arc::new(vs.iter().cloned().map(Value::from).collect()))
             }
             ValueRef::Decimal(v) => Value::Decimal(v),
             ValueRef::Enum8(e_v, v) => Value::Enum8(e_v, v),
@@ -401,6 +415,9 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
                     ref_vec.push(value_ref)
                 }
                 ValueRef::Array(t, Arc::new(ref_vec))
+            }
+            Value::Tuple(t, vs) => {
+                ValueRef::Tuple(t, Arc::new(vs.iter().map(ValueRef::from).collect()))
             }
             Value::Decimal(v) => ValueRef::Decimal(v.clone()),
             Value::Enum8(values, v) => ValueRef::Enum8(values.to_vec(), *v),

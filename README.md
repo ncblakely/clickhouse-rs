@@ -29,6 +29,12 @@ clickhouse-rs = "*"
 * IPv4/IPv6
 * UUID
 * Bool
+* Tuple(T1, T2, ...) and named Tuple(name T1, ...) (result decoding only)
+
+Tuple results are read positionally with `row.get::<(u64, String), _>("tuple_column")?`.
+Rust tuple conversions support `()` and one through twelve elements, including nested tuples
+and `Vec<(...)>` for `Array(Tuple(...))`. Use `types::Value` or `types::ValueRef` for tuples
+of arbitrary size. Tuple column construction for inserts is not supported.
 
 ## DNS
 

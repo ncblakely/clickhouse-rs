@@ -230,7 +230,6 @@ fn read_inner<R: ReadEx>(
         return Ok((inner, keys));
     }
 
-    read_prefix(reader)?;
     let flags: u64 = reader.read_scalar()?;
     let index_type = IndexType::from_flags(flags)?;
 
@@ -261,7 +260,7 @@ fn read_inner<R: ReadEx>(
     Ok((inner, keys))
 }
 
-fn read_prefix<R: ReadEx>(reader: &mut R) -> Result<()> {
+pub(super) fn read_prefix<R: ReadEx>(reader: &mut R) -> Result<()> {
     let version: u64 = reader.read_scalar()?;
     if version != LOW_CARDINALITY_VERSION {
         return Err(Error::Driver(DriverError::Deserialize(Cow::from(

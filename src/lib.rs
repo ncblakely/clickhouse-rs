@@ -22,6 +22,12 @@
 //! * SimpleAggregateFunction(F, T)
 //! * IPv4/IPv6
 //! * UUID
+//! * Tuple(T1, T2, ...) and named Tuple(name T1, ...) (result decoding only)
+//!
+//! Tuple results can be read positionally with `row.get::<(u64, String), _>("tuple_column")?`.
+//! Rust tuples of zero through twelve elements are supported, including nested tuples and
+//! `Vec<(...)>` for arrays of tuples. Use [`types::Value`] or [`types::ValueRef`] for arbitrary
+//! arity. Tuple column construction for inserts is not supported.
 //!
 //! ### DNS
 //!

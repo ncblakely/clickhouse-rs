@@ -12,14 +12,82 @@ use crate::{
     types::{
         column::datetime64::to_datetime,
         value::{decode_ipv4, decode_ipv6},
-        Decimal, Enum16, Enum8, SqlType, ValueRef,
+        Decimal, Enum16, Enum8, SqlType, Value, ValueRef,
     },
 };
 
 pub type FromSqlResult<T> = Result<T>;
 
+/// Converts a decoded ClickHouse value into a Rust value.
+///
+/// Tuples are read positionally as Rust tuples of up to twelve elements, including
+/// `()` and `(T,)`. Use `Value` or `ValueRef` to inspect tuples of arbitrary arity.
 pub trait FromSql<'a>: Sized {
     fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self>;
+}
+
+impl<'a> FromSql<'a> for ValueRef<'a> {
+    fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+        Ok(value)
+    }
+}
+
+impl<'a> FromSql<'a> for Value {
+    fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+        Ok(value.into())
+    }
+}
+
+macro_rules! from_sql_tuple_impl {
+    ($($len:literal => ($($t:ident: $index:tt),*));* $(;)?) => {
+        $(
+            impl<'a, $($t: FromSql<'a>),*> FromSql<'a> for ($($t,)*) {
+                fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+                    match value {
+                        ValueRef::Tuple(_, values) if values.len() == $len => {
+                            Ok(($($t::from_sql(values[$index].clone())?,)*))
+                        }
+                        value => Err(Error::FromSql(FromSqlError::InvalidType {
+                            src: SqlType::from(value).to_string(),
+                            dst: std::any::type_name::<Self>().into(),
+                        })),
+                    }
+                }
+            }
+
+            impl<'a, $($t: FromSql<'a>),*> FromSql<'a> for Vec<($($t,)*)> {
+                fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+                    match value {
+                        ValueRef::Array(SqlType::Tuple(_), values) => values
+                            .iter()
+                            .cloned()
+                            .map(<($($t,)*)>::from_sql)
+                            .collect(),
+                        value => Err(Error::FromSql(FromSqlError::InvalidType {
+                            src: SqlType::from(value).to_string(),
+                            dst: std::any::type_name::<Self>().into(),
+                        })),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+from_sql_tuple_impl! {
+    0 => ();
+    1 => (A: 0);
+    2 => (A: 0, B: 1);
+    3 => (A: 0, B: 1, C: 2);
+    4 => (A: 0, B: 1, C: 2, D: 3);
+    5 => (A: 0, B: 1, C: 2, D: 3, E: 4);
+    6 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+    7 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+    8 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
+    9 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8);
+    10 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9);
+    11 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10);
+    12 => (A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11);
 }
 
 macro_rules! from_sql_impl {
