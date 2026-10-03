@@ -36,8 +36,10 @@ impl MapColumnData {
             _ => offsets.at(rows - 1) as usize,
         };
 
-        let keys = <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, types.0, size, tz)?;
-        let values = <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, types.1, size, tz)?;
+        let keys =
+            <dyn ColumnData>::load_data_body::<ArcColumnWrapper, _>(reader, types.0, size, tz)?;
+        let values =
+            <dyn ColumnData>::load_data_body::<ArcColumnWrapper, _>(reader, types.1, size, tz)?;
 
         Ok(Self {
             keys,

@@ -10,7 +10,7 @@ use combine::{
 
 use crate::{
     binary::ReadEx,
-    errors::Result,
+    errors::{DriverError, Result},
     types::{
         column::{
             array::ArrayColumnData,
@@ -23,12 +23,13 @@ use crate::{
             fixed_string::FixedStringColumnData,
             ip::{IpColumnData, Ipv4, Ipv6, Uuid},
             list::List,
-            low_cardinality::LowCardinalityColumnData,
+            low_cardinality::{self, LowCardinalityColumnData},
             map::MapColumnData,
             nullable::NullableColumnData,
             numeric::VectorColumnData,
             simple_agg_func::SimpleAggregateFunctionColumnData,
             string::StringColumnData,
+            tuple::{parse_tuple_type, TupleColumnData},
             ArcColumnWrapper, BoxColumnWrapper, ColumnWrapper,
         },
         decimal::NoBits,
@@ -54,8 +55,41 @@ macro_rules! match_str {
 }
 
 impl dyn ColumnData {
-    #[allow(clippy::cognitive_complexity)]
     pub(crate) fn load_data<W: ColumnWrapper, T: ReadEx>(
+        reader: &mut T,
+        type_name: &str,
+        size: usize,
+        tz: Tz,
+    ) -> Result<W::Wrapper> {
+        if size != 0 {
+            Self::read_state_prefix(reader, type_name)?;
+        }
+        Self::load_data_body::<W, _>(reader, type_name, size, tz)
+    }
+
+    fn read_state_prefix<T: ReadEx>(reader: &mut T, type_name: &str) -> Result<()> {
+        // Native writes every nested state prefix before any column values or offsets.
+        if parse_low_cardinality(type_name).is_some() {
+            low_cardinality::read_prefix(reader)?;
+        } else if let Some(inner) =
+            parse_nullable_type(type_name).or_else(|| parse_array_type(type_name))
+        {
+            Self::read_state_prefix(reader, inner)?;
+        } else if let Some((key, value)) = parse_map_type(type_name) {
+            Self::read_state_prefix(reader, key)?;
+            Self::read_state_prefix(reader, value)?;
+        } else if let Some((_, inner)) = parse_simple_agg_fun(type_name) {
+            Self::read_state_prefix(reader, inner)?;
+        } else if let Some(fields) = parse_tuple_type(type_name) {
+            for (_, type_name) in fields {
+                Self::read_state_prefix(reader, type_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    pub(crate) fn load_data_body<W: ColumnWrapper, T: ReadEx>(
         reader: &mut T,
         type_name: &str,
         size: usize,
@@ -89,6 +123,8 @@ impl dyn ColumnData {
                     W::wrap(ArrayColumnData::load(reader, inner_type, size, tz)?)
                 } else if let Some(inner_type) = parse_map_type(type_name) {
                     W::wrap(MapColumnData::load(reader, inner_type, size, tz)?)
+                } else if let Some(fields) = parse_tuple_type(type_name) {
+                    W::wrap(TupleColumnData::load(reader, fields, size, tz)?)
                 } else if let Some((precision, scale, nobits)) = parse_decimal(type_name) {
                     W::wrap(DecimalColumnData::load(
                         reader, precision, scale, nobits, size, tz,
@@ -223,6 +259,9 @@ impl dyn ColumnData {
                 )?,
                 size: 0,
             }),
+            SqlType::Tuple(_) => {
+                return Err(DriverError::TupleInsertUnsupported.into());
+            }
             SqlType::LowCardinality(inner) => {
                 W::wrap(
                     LowCardinalityColumnData::empty(inner, timezone, capacity)?, // LowCardinalityColumnData {
@@ -243,23 +282,15 @@ impl dyn ColumnData {
 }
 
 fn parse_fixed_string(source: &str) -> Option<usize> {
-    if !source.starts_with("FixedString") {
-        return None;
-    }
-
-    let inner_size = &source[12..source.len() - 1];
-    match inner_size.parse::<usize>() {
-        Err(_) => None,
-        Ok(value) => Some(value),
-    }
+    source
+        .strip_prefix("FixedString(")?
+        .strip_suffix(')')?
+        .parse()
+        .ok()
 }
 
 fn parse_nullable_type(source: &str) -> Option<&str> {
-    if !source.starts_with("Nullable") {
-        return None;
-    }
-
-    let inner_type = &source[9..source.len() - 1];
+    let inner_type = source.strip_prefix("Nullable(")?.strip_suffix(')')?;
 
     if inner_type.starts_with("Nullable") {
         return None;
@@ -269,21 +300,12 @@ fn parse_nullable_type(source: &str) -> Option<&str> {
 }
 
 fn parse_array_type(source: &str) -> Option<&str> {
-    if !source.starts_with("Array") {
-        return None;
-    }
-
-    let inner_type = &source[6..source.len() - 1];
-    Some(inner_type)
+    source.strip_prefix("Array(")?.strip_suffix(')')
 }
 
 fn parse_map_type(source: &str) -> Option<(&str, &str)> {
-    if !source.starts_with("Map") {
-        return None;
-    }
-
-    let body = &source[4..source.len() - 1];
-    let comma_pos = body.chars().position(|c| c == ',')?;
+    let body = source.strip_prefix("Map(")?.strip_suffix(')')?;
+    let comma_pos = body.find(',')?;
 
     let key = body[0..comma_pos].trim();
     let value = body[comma_pos + 1..].trim();
@@ -292,11 +314,9 @@ fn parse_map_type(source: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_simple_agg_fun(source: &str) -> Option<(SimpleAggFunc, &str)> {
-    if !source.starts_with("SimpleAggregateFunction(") || !source.ends_with(')') {
-        return None;
-    }
-
-    let args = source[23..].trim_matches(|c| c == '(' || c == ')');
+    let args = source
+        .strip_prefix("SimpleAggregateFunction(")?
+        .strip_suffix(')')?;
     let sep_index = args.find(',')?;
 
     let agg_func = args[..sep_index].trim();
@@ -517,26 +537,14 @@ fn parse_date_time64(source: &str) -> Option<(u32, Option<String>)> {
 }
 
 fn parse_low_cardinality(source: &str) -> Option<&str> {
-    if !source.starts_with("LowCardinality") {
-        return None;
-    }
-
-    let mut lo = 14;
-    let mut hi = source.len() - 1;
-
-    while lo < source.len() && &source[lo..lo + 1] != "(" {
-        lo += 1;
-    }
-
-    while hi > lo && &source[hi..hi + 1] != ")" {
-        hi -= 1;
-    }
-
-    if lo >= hi {
-        return None;
-    }
-
-    Some(source[lo + 1..hi].trim())
+    Some(
+        source
+            .strip_prefix("LowCardinality")?
+            .trim()
+            .strip_prefix('(')?
+            .strip_suffix(')')?
+            .trim(),
+    )
 }
 
 fn get_timezone(timezone: &Option<String>, tz: Tz) -> Result<Tz> {

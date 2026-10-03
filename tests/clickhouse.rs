@@ -53,6 +53,103 @@ fn collect_values<'b, T: FromSql<'b>>(block: &'b Block<Complex>, column: &str) -
 
 #[cfg(feature = "tokio_io")]
 #[tokio::test]
+async fn test_tuple_decode() -> Result<(), Error> {
+    let pool = Pool::new(database_url());
+    let mut client = pool.get_handle().await?;
+    let block = client
+        .query(
+            r"
+            SELECT
+                (number, toString(number)) AS unnamed,
+                CAST((number, toString(number)), 'Tuple(id UInt64, label String)') AS named,
+                (number, (toString(number), CAST(NULL, 'Nullable(Int16)'))) AS nested,
+                [(number, 'first'), (number + 1, 'second')] AS tuples,
+                map('key', (number, 'value')) AS mapped,
+                tuple() AS empty,
+                [tuple(), tuple()] AS empty_tuples
+            FROM numbers(3)
+            SETTINGS max_block_size = 1",
+        )
+        .fetch_all()
+        .await?;
+
+    assert_eq!(block.row_count(), 3);
+    for (index, row) in block.rows().enumerate() {
+        let number = index as u64;
+        assert_eq!(
+            row.get::<(u64, String), _>("unnamed")?,
+            (number, number.to_string())
+        );
+        assert_eq!(
+            row.get::<(u64, String), _>("named")?,
+            (number, number.to_string())
+        );
+        assert_eq!(
+            row.get::<(u64, (String, Option<i16>)), _>("nested")?,
+            (number, (number.to_string(), None))
+        );
+        assert_eq!(
+            row.get::<Vec<(u64, &str)>, _>("tuples")?,
+            vec![(number, "first"), (number + 1, "second")]
+        );
+        assert_eq!(
+            row.get::<HashMap<&str, (u64, &str)>, _>("mapped")?,
+            HashMap::from([("key", (number, "value"))])
+        );
+        row.get::<(), _>("empty")?;
+        assert_eq!(row.get::<Vec<()>, _>("empty_tuples")?, vec![(), ()]);
+    }
+    assert_eq!(
+        block.get_column("named")?.sql_type(),
+        SqlType::Tuple(vec![
+            (Some("id".into()), SqlType::UInt64),
+            (Some("label".into()), SqlType::String),
+        ])
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tokio_io")]
+#[tokio::test]
+async fn test_tuple_low_cardinality_decode() -> Result<(), Error> {
+    let pool = Pool::new(database_url());
+    let mut client = pool.get_handle().await?;
+    let block = client
+        .query(
+            r"
+            SELECT
+                (number, toLowCardinality(toString(number % 2))) AS t,
+                [(number, toLowCardinality('value'))] AS array_t,
+                map('key', (number, toLowCardinality('value'))) AS map_t,
+                (toLowCardinality('first'), (number, toLowCardinality('second'))) AS nested_t
+            FROM numbers(3)",
+        )
+        .fetch_all()
+        .await?;
+    assert_eq!(
+        collect_values::<(u64, &str)>(&block, "t"),
+        vec![(0, "0"), (1, "1"), (2, "0")]
+    );
+    for (index, row) in block.rows().enumerate() {
+        let number = index as u64;
+        assert_eq!(
+            row.get::<Vec<(u64, &str)>, _>("array_t")?,
+            vec![(number, "value")]
+        );
+        assert_eq!(
+            row.get::<HashMap<&str, (u64, &str)>, _>("map_t")?,
+            HashMap::from([("key", (number, "value"))])
+        );
+        assert_eq!(
+            row.get::<(&str, (u64, &str)), _>("nested_t")?,
+            ("first", (number, "second"))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tokio_io")]
+#[tokio::test]
 async fn test_ping() -> Result<(), Error> {
     let pool = Pool::new(database_url());
 

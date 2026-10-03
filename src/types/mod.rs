@@ -339,6 +339,8 @@ pub enum SqlType {
     Enum16(Vec<(String, i16)>),
     SimpleAggregateFunction(SimpleAggFunc, &'static SqlType),
     Map(&'static SqlType, &'static SqlType),
+    /// Tuple elements in order, with optional names for named tuples.
+    Tuple(Vec<(Option<String>, SqlType)>),
 }
 
 lazy_static! {
@@ -374,6 +376,18 @@ impl From<SqlType> for &'static SqlType {
 }
 
 impl SqlType {
+    pub(crate) fn contains_tuple(&self) -> bool {
+        match self {
+            SqlType::Tuple(_) => true,
+            SqlType::Array(inner)
+            | SqlType::Nullable(inner)
+            | SqlType::LowCardinality(inner)
+            | SqlType::SimpleAggregateFunction(_, inner) => inner.contains_tuple(),
+            SqlType::Map(key, value) => key.contains_tuple() || value.contains_tuple(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn is_datetime(&self) -> bool {
         matches!(self, SqlType::DateTime(_))
     }
@@ -444,6 +458,19 @@ impl SqlType {
                 format!("Enum16({})", a.join(",")).into()
             }
             SqlType::Map(k, v) => format!("Map({}, {})", &k, &v).into(),
+            SqlType::Tuple(fields) => {
+                let fields: Vec<String> = fields
+                    .iter()
+                    .map(|(name, sql_type)| match name {
+                        Some(name) => format!(
+                            "`{}` {sql_type}",
+                            name.replace('\\', "\\\\").replace('`', "\\`")
+                        ),
+                        None => sql_type.to_string().into_owned(),
+                    })
+                    .collect();
+                format!("Tuple({})", fields.join(", ")).into()
+            }
         }
     }
 

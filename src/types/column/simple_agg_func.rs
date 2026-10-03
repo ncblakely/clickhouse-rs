@@ -27,7 +27,7 @@ impl SimpleAggregateFunctionColumnData {
         tz: Tz,
     ) -> Result<Self> {
         let inner =
-            <dyn ColumnData>::load_data::<ArcColumnWrapper, _>(reader, type_name, size, tz)?;
+            <dyn ColumnData>::load_data_body::<ArcColumnWrapper, _>(reader, type_name, size, tz)?;
         Ok(SimpleAggregateFunctionColumnData { inner, func })
     }
 }
