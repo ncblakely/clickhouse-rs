@@ -29,6 +29,7 @@ use crate::{
             numeric::VectorColumnData,
             simple_agg_func::SimpleAggregateFunctionColumnData,
             string::StringColumnData,
+            temporal::{Date32ColumnData, Time64ColumnData},
             ArcColumnWrapper, BoxColumnWrapper, ColumnWrapper,
         },
         decimal::NoBits,
@@ -77,6 +78,7 @@ impl dyn ColumnData {
             "Float64" | "Double" => W::wrap(VectorColumnData::<f64>::load(reader, size)?),
             "String" | "Char" | "Varchar" | "Text" | "TinyText" | "MediumText" | "LongText" | "Blob" | "TinyBlob" | "MediumBlob" | "LongBlob" => W::wrap(StringColumnData::load(reader, size)?),
             "Date" => W::wrap(DateColumnData::<u16>::load(reader, size, tz)?),
+            "Date32" => W::wrap(Date32ColumnData::load(reader, size)?),
             "IPv4" => W::wrap(IpColumnData::<Ipv4>::load(reader, size)?),
             "IPv6" => W::wrap(IpColumnData::<Ipv6>::load(reader, size)?),
             "UUID" => W::wrap(IpColumnData::<Uuid>::load(reader, size)?),
@@ -103,6 +105,9 @@ impl dyn ColumnData {
                 } else if let Some((precision, timezone)) = parse_date_time64(type_name) {
                     let column_timezone = get_timezone(&timezone, tz)?;
                     W::wrap(DateTime64ColumnData::load(reader, size, precision, column_timezone)?)
+                } else if type_name.starts_with("Time64") {
+                    let precision = parse_time64(type_name)?;
+                    W::wrap(Time64ColumnData::load(reader, size, precision)?)
                 } else if let Some((func, inner_type)) = parse_simple_agg_fun(type_name) {
                     W::wrap(SimpleAggregateFunctionColumnData::load(reader, func, inner_type, size, tz)?)
                 } else if let Some(inner_type) = parse_low_cardinality(type_name) {
@@ -144,6 +149,10 @@ impl dyn ColumnData {
             SqlType::Uuid => W::wrap(IpColumnData::<Uuid>::with_capacity(capacity)),
 
             SqlType::Date => W::wrap(DateColumnData::<u16>::with_capacity(capacity, timezone)),
+            SqlType::Date32 => W::wrap(Date32ColumnData::with_capacity(capacity)),
+            SqlType::Time64(precision) => {
+                W::wrap(Time64ColumnData::with_capacity(capacity, precision.get())?)
+            }
             SqlType::DateTime(DateTimeType::DateTime64(precision, timezone)) => W::wrap(
                 DateTime64ColumnData::with_capacity(capacity, precision, timezone),
             ),
@@ -242,6 +251,22 @@ impl dyn ColumnData {
     }
 }
 
+fn parse_time64(source: &str) -> Result<u8> {
+    let digits = source
+        .strip_prefix("Time64(")
+        .and_then(|body| body.strip_suffix(')'))
+        .map(str::trim)
+        .ok_or_else(|| format!("Invalid Time64 column type \"{source}\"."))?;
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return Err(format!("Invalid Time64 precision in \"{source}\".").into());
+    }
+    let precision: u8 = digits
+        .parse()
+        .map_err(|_| format!("Invalid Time64 precision in \"{source}\"."))?;
+    crate::types::Time64Precision::new(precision)?;
+    Ok(precision)
+}
+
 fn parse_fixed_string(source: &str) -> Option<usize> {
     if !source.starts_with("FixedString") {
         return None;
@@ -292,11 +317,9 @@ fn parse_map_type(source: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_simple_agg_fun(source: &str) -> Option<(SimpleAggFunc, &str)> {
-    if !source.starts_with("SimpleAggregateFunction(") || !source.ends_with(')') {
-        return None;
-    }
-
-    let args = source[23..].trim_matches(|c| c == '(' || c == ')');
+    let args = source
+        .strip_prefix("SimpleAggregateFunction(")?
+        .strip_suffix(')')?;
     let sep_index = args.find(',')?;
 
     let agg_func = args[..sep_index].trim();
@@ -542,7 +565,9 @@ fn parse_low_cardinality(source: &str) -> Option<&str> {
 fn get_timezone(timezone: &Option<String>, tz: Tz) -> Result<Tz> {
     match timezone {
         None => Ok(tz),
-        Some(t) => t.parse().map_err(|e| crate::errors::Error::Other(format!("invalid timezone: {e}").into())),
+        Some(t) => t
+            .parse()
+            .map_err(|e| crate::errors::Error::Other(format!("invalid timezone: {e}").into())),
     }
 }
 
@@ -756,6 +781,56 @@ mod test {
         let expected = Some((SimpleAggFunc::Sum, "Double"));
         let actual = parse_simple_agg_fun("SimpleAggregateFunction( sum , Double )");
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn test_parse_simple_agg_fun_strips_one_outer_delimiter_pair() {
+        assert_eq!(
+            parse_simple_agg_fun("SimpleAggregateFunction(anyLast, Time64(6))"),
+            Some((SimpleAggFunc::AnyLast, "Time64(6)"))
+        );
+
+        for (source, expected) in [
+            (
+                "SimpleAggregateFunction(any, Date32)",
+                (SimpleAggFunc::Any, "Date32"),
+            ),
+            (
+                "SimpleAggregateFunction(sum, Decimal(18, 4))",
+                (SimpleAggFunc::Sum, "Decimal(18, 4)"),
+            ),
+            (
+                "SimpleAggregateFunction(anyLast, DateTime64(3, 'UTC'))",
+                (SimpleAggFunc::AnyLast, "DateTime64(3, 'UTC')"),
+            ),
+            (
+                "SimpleAggregateFunction(any, FixedString(16))",
+                (SimpleAggFunc::Any, "FixedString(16)"),
+            ),
+            (
+                "SimpleAggregateFunction(anyLast, Nullable(Time64(6)))",
+                (SimpleAggFunc::AnyLast, "Nullable(Time64(6))"),
+            ),
+            (
+                "SimpleAggregateFunction(groupArrayArray, Array(Time64(6)))",
+                (SimpleAggFunc::GroupArrayArray, "Array(Time64(6))"),
+            ),
+        ] {
+            assert_eq!(parse_simple_agg_fun(source), Some(expected), "{source}");
+        }
+
+        assert_eq!(
+            parse_simple_agg_fun("SimpleAggregateFunction(anyLast, Time64(6)"),
+            Some((SimpleAggFunc::AnyLast, "Time64(6"))
+        );
+
+        for source in [
+            "SimpleAggregateFunction(Time64(6))",
+            "SimpleAggregateFunction(notAnAggregate, Time64(6))",
+            "Map(UInt8, UInt8)",
+        ] {
+            assert_eq!(parse_simple_agg_fun(source), None, "{source}");
+        }
     }
 
     #[test]
